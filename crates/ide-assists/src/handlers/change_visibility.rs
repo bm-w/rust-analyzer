@@ -4,7 +4,7 @@ use syntax::{
     SyntaxKind::{
         CONST, ENUM, FN, MACRO_DEF, MODULE, STATIC, STRUCT, TRAIT, TYPE_ALIAS, USE, VISIBILITY,
     },
-    T,
+    SyntaxNode, T,
 };
 
 use crate::{utils::vis_offset, AssistContext, AssistId, AssistKind, Assists};
@@ -29,25 +29,23 @@ pub(crate) fn change_visibility(acc: &mut Assists, ctx: &AssistContext<'_>) -> O
 
 fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let item_keyword = ctx.token_at_offset().find(|leaf| {
-        matches!(
-            leaf.kind(),
-            T![const]
-                | T![static]
-                | T![fn]
-                | T![mod]
-                | T![struct]
-                | T![enum]
-                | T![trait]
-                | T![type]
-                | T![use]
-                | T![macro]
-        )
+        matches!(leaf.kind(),
+            | T![const]
+            | T![static]
+            | T![fn]
+            | T![mod]
+            | T![struct]
+            | T![enum]
+            | T![trait]
+            | T![type]
+            | T![use]
+            | T![macro])
     });
 
-    let (offset, target) = if let Some(keyword) = item_keyword {
+    let (offset, target, scope) = if let Some(keyword) = item_keyword {
         let parent = keyword.parent()?;
         let def_kws =
-            vec![CONST, STATIC, TYPE_ALIAS, FN, MODULE, STRUCT, ENUM, TRAIT, USE, MACRO_DEF];
+            vec![CONST, STATIC, FN, MODULE, STRUCT, ENUM, TRAIT, TYPE_ALIAS, USE, MACRO_DEF];
         // Parent is not a definition, can't add visibility
         if !def_kws.iter().any(|&def_kw| def_kw == parent.kind()) {
             return None;
@@ -56,7 +54,8 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         if parent.children().any(|child| child.kind() == VISIBILITY) {
             return None;
         }
-        (vis_offset(&parent), keyword.text_range())
+        let skip_first_module_ancestor = parent.kind() == MODULE;
+        (vis_offset(&parent), keyword.text_range(), scope(&parent, skip_first_module_ancestor))
     } else if let Some(field_name) = ctx.find_node_at_offset::<ast::Name>() {
         let field = field_name.syntax().ancestors().find_map(ast::RecordField::cast)?;
         if field.name()? != field_name {
@@ -66,28 +65,38 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         if field.visibility().is_some() {
             return None;
         }
-        (vis_offset(field.syntax()), field_name.syntax().text_range())
+        (vis_offset(field.syntax()), field_name.syntax().text_range(), scope(field.syntax(), false))
     } else if let Some(field) = ctx.find_node_at_offset::<ast::TupleField>() {
         if field.visibility().is_some() {
             return None;
         }
-        (vis_offset(field.syntax()), field.syntax().text_range())
+        (vis_offset(field.syntax()), field.syntax().text_range(), scope(field.syntax(), false))
     } else {
         return None;
     };
 
+    fn scope(node: &SyntaxNode, skip_first_module_ancestor: bool) -> &'static str {
+        let in_module = node
+            .ancestors()
+            .filter(|anc| anc.kind() == MODULE)
+            .nth(if skip_first_module_ancestor { 1 } else { 0 })
+            .is_some();
+        if in_module { "super" } else { "crate" }
+    }
+
     acc.add(
         AssistId("change_visibility", AssistKind::RefactorRewrite),
-        "Change visibility to pub(crate)",
+        format!("Change visibility to pub({scope})"),
         target,
         |edit| {
-            edit.insert(offset, "pub(crate) ");
+            edit.insert(offset, format!("pub({scope}) "));
         },
     )
 }
 
 fn change_vis(acc: &mut Assists, vis: ast::Visibility) -> Option<()> {
-    if vis.syntax().text() == "pub" {
+    let vis_is_super = vis.syntax().text() == "pub(super)";
+    if vis_is_super || vis.syntax().text() == "pub" {
         let target = vis.syntax().text_range();
         return acc.add(
             AssistId("change_visibility", AssistKind::RefactorRewrite),
@@ -98,7 +107,7 @@ fn change_vis(acc: &mut Assists, vis: ast::Visibility) -> Option<()> {
             },
         );
     }
-    if vis.syntax().text() == "pub(crate)" {
+    if vis_is_super || vis.syntax().text() == "pub(crate)" {
         let target = vis.syntax().text_range();
         return acc.add(
             AssistId("change_visibility", AssistKind::RefactorRewrite),
@@ -196,6 +205,30 @@ mod tests {
             pub(crate) struct Foo;
             ",
         )
+    }
+
+    #[test]
+    fn change_visibility_adds_super_within_mod() {
+        check_assist(
+            change_visibility,
+            r"mod foo { m$0od bar {} }",
+            r"mod foo { pub(super) mod bar {} }",
+        );
+        check_assist(
+            change_visibility,
+            r"mod foo { s$0truct S; }",
+            r"mod foo { pub(super) struct S; }",
+        );
+        check_assist(
+            change_visibility,
+            r"mod foo { struct S(($0)); }",
+            r"mod foo { struct S(pub(super) ()); }",
+        );
+        check_assist(
+            change_visibility,
+            r"mod foo { struct S { b$0ar: () } }",
+            r"mod foo { struct S { pub(super) bar: () } }",
+        );
     }
 
     #[test]
