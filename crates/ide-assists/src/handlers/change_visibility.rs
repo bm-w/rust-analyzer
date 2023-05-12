@@ -1,3 +1,4 @@
+use ide_db::source_change::SourceChangeBuilder;
 use syntax::{
     ast::{self, HasName, HasVisibility},
     AstNode,
@@ -6,6 +7,7 @@ use syntax::{
     },
     SyntaxNode, T,
 };
+use text_edit::{TextSize, TextRange};
 
 use crate::{utils::vis_offset, AssistContext, AssistId, AssistKind, Assists};
 
@@ -22,9 +24,14 @@ use crate::{utils::vis_offset, AssistContext, AssistId, AssistKind, Assists};
 // ```
 pub(crate) fn change_visibility(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     if let Some(vis) = ctx.find_node_at_offset::<ast::Visibility>() {
-        return change_vis(acc, vis);
+        if let Some(vis_parent) = vis.syntax().parent() {
+            let target = vis.syntax().text_range();
+            change_vis(acc, Some(vis), &vis_parent, Some(target));
+        }
+        return None;
+    } else {
+        add_vis(acc, ctx)
     }
-    add_vis(acc, ctx)
 }
 
 fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
@@ -42,7 +49,7 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
             | T![macro])
     });
 
-    let (offset, target, scope) = if let Some(keyword) = item_keyword {
+    if let Some(keyword) = item_keyword {
         let parent = keyword.parent()?;
         let def_kws =
             vec![CONST, STATIC, FN, MODULE, STRUCT, ENUM, TRAIT, TYPE_ALIAS, USE, MACRO_DEF];
@@ -54,8 +61,7 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         if parent.children().any(|child| child.kind() == VISIBILITY) {
             return None;
         }
-        let skip_first_module_ancestor = parent.kind() == MODULE;
-        (vis_offset(&parent), keyword.text_range(), scope(&parent, skip_first_module_ancestor))
+        change_vis(acc, None, &parent, Some(keyword.text_range()))
     } else if let Some(field_name) = ctx.find_node_at_offset::<ast::Name>() {
         let field = field_name.syntax().ancestors().find_map(ast::RecordField::cast)?;
         if field.name()? != field_name {
@@ -65,65 +71,179 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
         if field.visibility().is_some() {
             return None;
         }
-        (vis_offset(field.syntax()), field_name.syntax().text_range(), scope(field.syntax(), false))
+        change_vis(acc, None, field.syntax(), Some(field_name.syntax().text_range()))
     } else if let Some(field) = ctx.find_node_at_offset::<ast::TupleField>() {
         if field.visibility().is_some() {
             return None;
         }
-        (vis_offset(field.syntax()), field.syntax().text_range(), scope(field.syntax(), false))
+        change_vis(acc, None, field.syntax(), None)
     } else {
         return None;
-    };
-
-    fn scope(node: &SyntaxNode, skip_first_module_ancestor: bool) -> &'static str {
-        let in_module = node
-            .ancestors()
-            .filter(|anc| anc.kind() == MODULE)
-            .nth(if skip_first_module_ancestor { 1 } else { 0 })
-            .is_some();
-        if in_module { "super" } else { "crate" }
     }
-
-    acc.add(
-        AssistId("change_visibility", AssistKind::RefactorRewrite),
-        format!("Change visibility to pub({scope})"),
-        target,
-        |edit| {
-            edit.insert(offset, format!("pub({scope}) "));
-        },
-    )
 }
 
-fn change_vis(acc: &mut Assists, vis: ast::Visibility) -> Option<()> {
-    let vis_is_super = vis.syntax().text() == "pub(super)";
-    if vis_is_super || vis.syntax().text() == "pub" {
-        let target = vis.syntax().text_range();
-        return acc.add(
-            AssistId("change_visibility", AssistKind::RefactorRewrite),
-            "Change Visibility to pub(crate)",
-            target,
-            |edit| {
-                edit.replace(vis.syntax().text_range(), "pub(crate)");
-            },
-        );
-    }
-    if vis_is_super || vis.syntax().text() == "pub(crate)" {
-        let target = vis.syntax().text_range();
-        return acc.add(
+fn change_vis(
+    acc: &mut Assists,
+    vis: Option<ast::Visibility>,
+    vis_parent: &SyntaxNode,
+    target: Option<TextRange>,
+) -> Option<()> {
+
+    let target = target.unwrap_or_else(|| vis_parent.text_range());
+    let (vis_kind, offset_or_range) = if let Some(vis) = &vis {
+        let vis_kind = VisibilityKind::try_from(vis).ok()?;
+        let text_range = vis.syntax().text_range();
+        (Some(vis_kind), OffsetOrRange::Range(text_range))
+    } else {
+        (None, OffsetOrRange::Offset(vis_offset(vis_parent)))
+    };
+
+    if vis_kind != Some(VisibilityKind::Pub) {
+        acc.add(
             AssistId("change_visibility", AssistKind::RefactorRewrite),
             "Change visibility to pub",
             target,
             |edit| {
-                edit.replace(vis.syntax().text_range(), "pub");
-            },
-        );
+                insert_or_replace(edit, offset_or_range, VisibilityKind::Pub);
+                promote_ancestors(edit, vis_parent, VisibilityKind::Pub);
+            }, 
+        )?;
     }
-    None
+
+    if vis_kind != Some(VisibilityKind::PubCrate) {
+        acc.add(
+            AssistId("change_visibility", AssistKind::RefactorRewrite),
+            "Change visibility to pub(crate)",
+            target,
+            |edit| {
+                insert_or_replace(edit, offset_or_range, VisibilityKind::PubCrate);
+                if vis_kind.map(|vk| vk < VisibilityKind::PubCrate).unwrap_or(true) {
+                    promote_ancestors(edit, vis_parent, VisibilityKind::PubCrate);
+                } else {
+                    demote_descendants(edit, vis.as_ref(), vis_parent, VisibilityKind::PubCrate);
+                }
+            },
+        )?;
+    }
+
+    let can_super = vis_parent.ancestors()
+        .filter_map(ast::Module::cast)
+        .nth(if vis_parent.kind() == MODULE { 1 } else { 0 })
+        .is_some();
+
+    if can_super && vis_kind != Some(VisibilityKind::PubSuper) {
+        acc.add(
+            AssistId("change_visibility", AssistKind::RefactorRewrite),
+            "Change visibility to pub(super)",
+            target,
+            |edit| {
+                insert_or_replace(edit, offset_or_range, VisibilityKind::PubSuper);
+                if vis_kind.map(|vk| vk < VisibilityKind::PubSuper).unwrap_or(true) {
+                    promote_ancestors(edit, vis_parent, VisibilityKind::PubSuper);
+                } else {
+                    demote_descendants(edit, vis.as_ref(), vis_parent, VisibilityKind::PubSuper);
+                }
+            },
+        )?;
+    }
+
+    #[derive(Clone, Copy)]
+    enum OffsetOrRange { Offset(TextSize), Range(TextRange) }
+    fn insert_or_replace(
+        edit: &mut SourceChangeBuilder,
+        offset_or_range: OffsetOrRange,
+        vis_kind: VisibilityKind
+    ) {
+        match offset_or_range {
+            OffsetOrRange::Offset(offset) => edit.insert(offset, format!("{} ", vis_kind.as_str())),
+            OffsetOrRange::Range(range) => edit.replace(range, vis_kind.as_str()),
+        }
+    }
+
+    /// Simplifies working with visibilities within this module.
+    /// `pub(in some::path)` is omitted because the complexity it introduces.
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
+    enum VisibilityKind { PubSelf, PubSuper, PubCrate, Pub }
+
+    impl<'v> TryFrom<&'v ast::Visibility> for VisibilityKind {
+        type Error = Option<String>; // An invalid path (e.g. `pub(in some::path)` or pub(invalid)`)
+        fn try_from(vis: &'v ast::Visibility) -> Result<Self, Self::Error> {
+            if vis.syntax().text() == "pub" { return Ok(VisibilityKind::Pub) }
+            let Some(path) = vis.path() else { return Err(None) };
+            match (vis.in_token(), path.syntax().text()) {
+                (None, path) if path == "crate" => Ok(VisibilityKind::PubCrate),
+                (None, path) if path == "super" => Ok(VisibilityKind::PubSuper),
+                (None, path) if path == "self" => Ok(VisibilityKind::PubSelf),
+                (_, invalid_path) => Err(Some(invalid_path.to_string())),
+            }
+        }
+    }
+
+    impl VisibilityKind {
+        fn as_str(&self) -> &'static str {
+            match self {
+                VisibilityKind::PubSelf => "pub(self)",
+                VisibilityKind::PubSuper => "pub(super)",
+                VisibilityKind::PubCrate => "pub(crate)",
+                VisibilityKind::Pub => "pub",
+            }
+        }
+    }
+
+    fn promote_ancestors(
+        edit: &mut SourceChangeBuilder,
+        vis_parent: &SyntaxNode,
+        new_visibility_kind: VisibilityKind,
+    ) {
+        if vis_parent.kind() != STRUCT {
+            if let Some(strukt) = vis_parent.ancestors().find_map(ast::Struct::cast) {
+                if !promote(edit, &strukt, new_visibility_kind) { return }
+            }
+        }
+
+        if new_visibility_kind == VisibilityKind::PubSuper { return }
+
+        let skip = if vis_parent.kind() == MODULE { 1 } else { 0 };
+        for module in vis_parent.ancestors().skip(skip).filter_map(ast::Module::cast) {
+            if !promote(edit, &module, new_visibility_kind) { break }
+        }
+
+        fn promote(
+            edit: &mut SourceChangeBuilder,
+            node: &(impl AstNode + HasVisibility + std::fmt::Debug),
+            new_visibility_kind: VisibilityKind,
+        ) -> bool {
+            if let Some(vis) = node.visibility() {
+                if VisibilityKind::try_from(&vis).map(|vk| vk >= new_visibility_kind)
+                    .unwrap_or(true) { return false }
+                edit.replace(vis.syntax().text_range(), new_visibility_kind.as_str());
+            } else {
+                edit.insert(vis_offset(node.syntax()), format!("{} ", new_visibility_kind.as_str()));
+            }
+            true
+        }
+    }
+
+    fn demote_descendants(
+        edit: &mut SourceChangeBuilder,
+        vis: Option<&ast::Visibility>,
+        vis_parent: &SyntaxNode,
+        new_visibility_kind: VisibilityKind,
+    ) {
+        for vis in vis_parent.descendants()
+            .filter_map(ast::Visibility::cast)
+            .filter(|v| vis.map(|vis| v != vis).unwrap_or(true)) {
+            if !matches!(VisibilityKind::try_from(&vis), Ok(vk) if vk > new_visibility_kind) { continue }
+            edit.replace(vis.syntax().text_range(), new_visibility_kind.as_str());
+        }
+    }
+
+    Some(())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{check_assist, check_assist_not_applicable, check_assist_target};
+    use crate::tests::{check_assist, check_assist_by_label, check_assist_not_applicable, check_assist_target};
 
     use super::*;
 
@@ -145,9 +265,13 @@ mod tests {
         check_assist(
             change_visibility,
             r"struct S { $0field: u32 }",
-            r"struct S { pub(crate) field: u32 }",
+            r"pub(crate) struct S { pub(crate) field: u32 }",
         );
-        check_assist(change_visibility, r"struct S ( $0u32 )", r"struct S ( pub(crate) u32 )");
+        check_assist(
+            change_visibility,
+            r"struct S ( $0u32 )",
+            r"pub(crate) struct S ( pub(crate) u32 )"
+        );
     }
 
     #[test]
@@ -222,12 +346,32 @@ mod tests {
         check_assist(
             change_visibility,
             r"mod foo { struct S(($0)); }",
-            r"mod foo { struct S(pub(super) ()); }",
+            r"mod foo { pub(super) struct S(pub(super) ()); }",
         );
         check_assist(
             change_visibility,
             r"mod foo { struct S { b$0ar: () } }",
-            r"mod foo { struct S { pub(super) bar: () } }",
+            r"mod foo { pub(super) struct S { pub(super) bar: () } }",
+        );
+        check_assist(
+            change_visibility,
+            r"mod foo { pub struct S { b$0ar: () } }",
+            r"mod foo { pub struct S { pub(super) bar: () } }",
+        );
+        check_assist_by_label(
+            change_visibility,
+            r"mod foo { struct S { b$0ar: () } }",
+            r"pub mod foo { pub struct S { pub bar: () } }",
+            "Change visibility to pub",
+        );
+    }
+
+    #[test]
+    fn change_visibility_demotions() {
+        check_assist(
+            change_visibility,
+            r"p$0ub mod foo { pub m$0od bar {} }",
+            r"pub(crate) mod foo { pub(crate) mod bar {} }",
         );
     }
 
